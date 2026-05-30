@@ -5,10 +5,120 @@ import requests
 import streamlit as st
 from tenacity import (
     retry,
+    retry_if_exception,
     stop_after_attempt,
     wait_random_exponential,
 )
 import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
+
+GEMINI_MODEL_CHAIN = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+]
+
+GEMINI_MODEL_LABELS = {
+    "gemini-2.5-flash-lite": "Gemini 2.5 Flash Lite",
+    "gemini-2.5-flash": "Gemini 2.5 Flash",
+    "gemini-2.5-pro": "Gemini 2.5 Pro",
+}
+
+GEMINI_GENERATION_CONFIG = {
+    "temperature": 1,
+    "top_p": 0.95,
+    "top_k": 0,
+    "max_output_tokens": 8192,
+}
+
+GEMINI_SAFETY_SETTINGS = [
+    {
+        "category": "HARM_CATEGORY_HARASSMENT",
+        "threshold": "BLOCK_MEDIUM_AND_ABOVE",
+    },
+    {
+        "category": "HARM_CATEGORY_HATE_SPEECH",
+        "threshold": "BLOCK_MEDIUM_AND_ABOVE",
+    },
+    {
+        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "threshold": "BLOCK_MEDIUM_AND_ABOVE",
+    },
+    {
+        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "threshold": "BLOCK_MEDIUM_AND_ABOVE",
+    },
+]
+
+
+def _exception_message(exc: Exception) -> str:
+    return str(exc).lower()
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    if isinstance(
+        exc,
+        (
+            google_exceptions.ResourceExhausted,
+            google_exceptions.ServiceUnavailable,
+            google_exceptions.DeadlineExceeded,
+            google_exceptions.InternalServerError,
+            google_exceptions.TooManyRequests,
+        ),
+    ):
+        return True
+    message = _exception_message(exc)
+    return any(
+        token in message
+        for token in ("429", "quota", "rate limit", "overloaded", "503", "timeout")
+    )
+
+
+def _is_fatal_gemini_error(exc: Exception) -> bool:
+    if isinstance(
+        exc,
+        (
+            google_exceptions.Unauthenticated,
+            google_exceptions.PermissionDenied,
+            google_exceptions.InvalidArgument,
+        ),
+    ):
+        return True
+    message = _exception_message(exc)
+    if not os.getenv("GEMINI_API_KEY"):
+        return True
+    return any(
+        token in message
+        for token in (
+            "api key",
+            "api_key",
+            "permission denied",
+            "unauthenticated",
+            "invalid api key",
+        )
+    )
+
+
+def _is_safety_block_error(exc: Exception) -> bool:
+    message = _exception_message(exc)
+    return any(
+        token in message
+        for token in ("safety", "blocked", "block_reason", "candidate was blocked")
+    )
+
+
+def _should_fallback_to_next_model(exc: Exception) -> bool:
+    if _is_fatal_gemini_error(exc) or _is_safety_block_error(exc):
+        return False
+    if _is_transient_error(exc):
+        return True
+    if isinstance(exc, google_exceptions.NotFound):
+        return True
+    message = _exception_message(exc)
+    return any(
+        token in message
+        for token in ("not found", "not supported", "404")
+    )
 
 
 def main():
@@ -100,11 +210,22 @@ def main():
             # Clicking without providing data, really ?
             if news_report:
                 status.update(label="Found some News aritcles, Creating News report..")
-                final_report = write_news_google_search(news_keywords, news_country, news_language, news_report, status)
-                st.subheader(f'**🧕🔬👩 Verify: Alwrity can make mistakes. Your Final News Report on {news_keywords}!**')
-                st.write(final_report)
-                st.write("\n\n\n\n\n")
-                status.update(label="Done: Scroll Down. Please Verify, Alwrity can make mistakes!", state="complete", expanded=True)
+                final_report = write_news_google_search(
+                    news_keywords, news_country, news_language, news_report, status
+                )
+                if final_report:
+                    st.subheader(
+                        f"**🧕🔬👩 Verify: Alwrity can make mistakes. Your Final News Report on {news_keywords}!**"
+                    )
+                    st.write(final_report)
+                    st.write("\n\n\n\n\n")
+                    status.update(
+                        label="Done: Scroll Down. Please Verify, Alwrity can make mistakes!",
+                        state="complete",
+                        expanded=True,
+                    )
+                else:
+                    st.write("💥**Failed to generate News Report. Please try again!**")
             else:
                 st.write("💥**Failed to generate News Report. Please try again!**")
 
@@ -131,12 +252,10 @@ def write_news_google_search(news_keywords, news_country, news_language, search_
         Google News Result: '''{search_results}'''
         """
     status.update(label="Writing News report from Google News search results.")
-    try:
-        response = generate_text_with_exception_handling(prompt)
-        return response
-    except Exception as err:
-        st.error(f"Exit: Failed to get response from LLM: {err}")
-        exit(1)
+    response = generate_text_with_exception_handling(prompt, status=status)
+    if not response:
+        st.error("Failed to get response from LLM. Please try again.")
+    return response
 
 
 def perform_serper_news_search(news_keywords, news_country, news_language, status):
@@ -177,59 +296,75 @@ def perform_serper_news_search(news_keywords, news_country, news_language, statu
             st.error(f"Error: {response.status_code}, {response.text}")
 
 
-@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-def generate_text_with_exception_handling(prompt):
-    """
-    Generates text using the Gemini model with exception handling.
+@retry(
+    wait=wait_random_exponential(min=1, max=30),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception(_is_transient_error),
+    reraise=True,
+)
+def _generate_with_gemini_model(prompt: str, model_name: str) -> str:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is missing. Set it in the .env file.")
 
-    Args:
-        api_key (str): Your Google Generative AI API key.
-        prompt (str): The prompt for text generation.
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        model_name=model_name,
+        generation_config=GEMINI_GENERATION_CONFIG,
+        safety_settings=GEMINI_SAFETY_SETTINGS,
+    )
+    convo = model.start_chat(history=[])
+    convo.send_message(prompt)
+    text = convo.last.text
+    if not text or not text.strip():
+        raise ValueError("Gemini returned an empty response.")
+    return text
+
+
+def generate_text_with_exception_handling(prompt, status=None):
+    """
+    Generates text using Gemini 2.5 models with per-model retry and fallback.
 
     Returns:
-        str: The generated text.
+        str: The generated text, or None if all models fail.
     """
+    last_error = None
 
-    try:
-        genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+    for index, model_name in enumerate(GEMINI_MODEL_CHAIN):
+        label = GEMINI_MODEL_LABELS.get(model_name, model_name)
+        if status:
+            status.update(label=f"Generating report with {label}...")
 
-        generation_config = {
-            "temperature": 1,
-            "top_p": 0.95,
-            "top_k": 0,
-            "max_output_tokens": 8192,
-        }
+        try:
+            return _generate_with_gemini_model(prompt, model_name)
+        except Exception as exc:
+            last_error = exc
+            if _is_fatal_gemini_error(exc):
+                st.error(f"Gemini configuration error: {exc}")
+                return None
+            if _is_safety_block_error(exc):
+                st.error(
+                    "Content was blocked by Gemini safety filters. "
+                    "Try different keywords or adjust your query."
+                )
+                return None
+            if not _should_fallback_to_next_model(exc):
+                st.error(f"Failed to generate report with {label}: {exc}")
+                return None
 
-        safety_settings = [
-            {
-                "category": "HARM_CATEGORY_HARASSMENT",
-                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-            },
-            {
-                "category": "HARM_CATEGORY_HATE_SPEECH",
-                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-            },
-            {
-                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-            },
-            {
-                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-            },
-        ]
+            next_index = index + 1
+            if next_index < len(GEMINI_MODEL_CHAIN):
+                next_model = GEMINI_MODEL_CHAIN[next_index]
+                next_label = GEMINI_MODEL_LABELS.get(next_model, next_model)
+                st.warning(f"{label} unavailable ({exc}). Trying {next_label}...")
+                if status:
+                    status.update(label=f"{label} failed, trying {next_label}...")
 
-        model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest",
-                                      generation_config=generation_config,
-                                      safety_settings=safety_settings)
-
-        convo = model.start_chat(history=[])
-        convo.send_message(prompt)
-        return convo.last.text
-
-    except Exception as e:
-        st.exception(f"An unexpected error occurred: {e}")
-        return None
+    st.error(
+        "All Gemini models failed to generate the report. "
+        f"Last error: {last_error}"
+    )
+    return None
 
 
 def get_language_name(language_code):
